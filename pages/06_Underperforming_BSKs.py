@@ -158,7 +158,7 @@ if st.session_state.filters:
         
         # Fetch data from backend (move this here to use sort_order)
         params['sort_order'] = sort_order
-        API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:54300")
+        API_BASE_URL = os.getenv("API_BASE_URL", "https://bsk-backend-uywi.onrender.com")
         df = pd.DataFrame()
         try:
             import requests

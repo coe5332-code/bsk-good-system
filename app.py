@@ -20,7 +20,9 @@ Each section provides interactive tables and visualizations for your data.\
 # Fetch data for overview
 # Use environment variable for API URL (for Hugging Face Spaces deployment)
 import os
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:54300")
+# Default to your deployed backend; allow override via `API_BASE_URL` env var.
+# For local development use: `export API_BASE_URL=http://localhost:54300` (or set in Windows).
+API_BASE_URL = os.getenv("API_BASE_URL", "https://bsk-backend-uywi.onrender.com")
 
 # Local parquet filenames mapping (same names as backend dataset)
 PARQUET_FILES = {

@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../b
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../ai_service')))
 
 # Configuration
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:54300")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://bsk-backend-uywi.onrender.com")
 
 # Import AI service functions with error handling and direct database access
 try:
