@@ -1,102 +1,16 @@
 import streamlit as st
 import pandas as pd
 import requests
-import sys
 import os
 import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
 import pydeck as pdk
-from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# Add paths for backend and AI service imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../backend')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../ai_service')))
-
 # Configuration
 API_BASE_URL = os.getenv("API_BASE_URL", "https://bsk-backend-uywi.onrender.com")
-
-# Import AI service functions with error handling and direct database access
-try:
-    # First try to import the AI functions
-    from ai_service.service_recommendation import recommend_bsk_for_service_from_db, initialize_embeddings_from_db
-    from ai_service.database_service import fetch_all_data_for_recommendations
-    AI_FUNCTIONS_AVAILABLE = True
-    DATABASE_AVAILABLE = True
-    
-except ImportError as e:
-    DATABASE_AVAILABLE = False
-    try:
-        # Fallback to basic recommendation without database
-        from ai_service.service_recommendation import recommend_bsk_for_service, initialize_service_embeddings
-        AI_FUNCTIONS_AVAILABLE = True
-        st.warning(f"⚠️ Database not available, using basic recommendation system. Error: {e}")
-        
-        # Create wrapper function that uses API instead of direct DB access
-        def recommend_bsk_for_service_from_db(new_service, top_n=10, target_location=None, use_precomputed_embeddings=True, include_inactive=False):
-            """Wrapper that uses API endpoints instead of direct database access"""
-            try:
-                # Get data from the FastAPI backend
-                services = fetch_data("services/")
-                provisions = fetch_data("provisions/")
-                bsk_centers = fetch_data("bsk/")
-                
-                if not all([services, provisions, bsk_centers]):
-                    st.error("❌ Could not fetch data from API. Please ensure backend is running.")
-                    return None
-                
-                # Convert to DataFrames 
-                services_df = pd.DataFrame(services)
-                provisions_df = pd.DataFrame(provisions)
-                bsk_df = pd.DataFrame(bsk_centers)
-                
-                # Call the recommendation function
-                return recommend_bsk_for_service(
-                    new_service=new_service,
-                    services_df=services_df,
-                    provisions_df=provisions_df,
-                    bsk_df=bsk_df,
-                    top_n=top_n,
-                    target_location=target_location,
-                    use_precomputed_embeddings=use_precomputed_embeddings
-                )
-            except Exception as e:
-                st.error(f"❌ Error in API-based recommendation: {e}")
-                return None
-        
-        def initialize_embeddings_from_db(*args, **kwargs):
-            """Initialize embeddings using API data when database is not available"""
-            try:
-                from ai_service.service_recommendation import initialize_service_embeddings
-                
-                # Get services data from API
-                services = fetch_data("services/")
-                if not services:
-                    st.info("📡 Cannot fetch services data from API for embedding initialization.")
-                    return False
-                
-                services_df = pd.DataFrame(services)
-                initialize_service_embeddings(services_df, force_rebuild=kwargs.get('force_rebuild', False))
-                st.info("✅ Embeddings initialized using API data.")
-                return True
-                
-            except Exception as e:
-                st.info(f"📡 Embedding initialization with API data failed: {e}")
-                return False
-            
-    except ImportError as e2:
-        st.error(f"❌ Critical error: Cannot import recommendation functions. Error: {e2}")
-        AI_FUNCTIONS_AVAILABLE = False
-        DATABASE_AVAILABLE = False
-        
-        # Create minimal fallback functions
-        def recommend_bsk_for_service_from_db(*args, **kwargs):
-            st.error("❌ No recommendation service available. Please check your setup.")
-            return None
-        def initialize_embeddings_from_db(*args, **kwargs):
-            return False
 
 # Initialize session state variables
 if 'recommendations' not in st.session_state:
@@ -109,7 +23,7 @@ if 'selected_bsk' not in st.session_state:
 def fetch_data(endpoint):
     """Fetch data from API with improved error handling"""
     try:
-        response = requests.get(f"{API_BASE_URL}/{endpoint}", timeout=5)
+        response = requests.get(f"{API_BASE_URL}/{endpoint}", timeout=30)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.ConnectionError:
@@ -125,30 +39,191 @@ def fetch_data(endpoint):
         st.warning(f"⚠️ Error fetching {endpoint}: {e}")
         return []
 
-def cluster_locations(df, n_clusters=81):
-    """Cluster locations to reduce the number of points on the map"""
-    if len(df) <= n_clusters:
-        return df
+def extract_keywords(text):
+    """Extract keywords from text"""
+    if pd.isna(text) or not text:
+        return set()
+    text_lower = str(text).lower()
+    # Simple keyword extraction - split by common delimiters
+    words = text_lower.replace(',', ' ').replace('.', ' ').replace(';', ' ').split()
+    # Filter out very short words
+    return set([w for w in words if len(w) > 3])
+
+def calculate_text_similarity(text1, text2):
+    """Calculate simple text similarity using keyword overlap"""
+    keywords1 = extract_keywords(text1)
+    keywords2 = extract_keywords(text2)
     
-    # Prepare coordinates for clustering
-    coords = df[['bsk_lat', 'bsk_long']].values
+    if not keywords1 or not keywords2:
+        return 0.0
     
-    # Perform clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    df['cluster'] = kmeans.fit_predict(coords)
+    intersection = keywords1.intersection(keywords2)
+    union = keywords1.union(keywords2)
     
-    # Get the top BSK from each cluster based on score
-    clustered_df = df.sort_values('score', ascending=False).groupby('cluster').first().reset_index()
-    return clustered_df.drop('cluster', axis=1)
+    if not union:
+        return 0.0
+    
+    return len(intersection) / len(union)
+
+def recommend_bsk_for_service_api(new_service, top_n=100, include_inactive=False):
+    """
+    Recommend BSKs for a new service using API data only.
+    This is a simplified version that works without ai_service module.
+    """
+    try:
+        # Fetch data from API
+        with st.spinner("📡 Fetching data from backend..."):
+            services_data = fetch_data("services/")
+            provisions_data = fetch_data("provisions/")
+            bsk_data = fetch_data("bsk/")
+        
+        if not all([services_data, provisions_data, bsk_data]):
+            st.error("❌ Could not fetch required data from API. Please ensure backend is running.")
+            return None, None
+        
+        # Convert to DataFrames
+        services_df = pd.DataFrame(services_data)
+        provisions_df = pd.DataFrame(provisions_data)
+        bsk_df = pd.DataFrame(bsk_data)
+        
+        if services_df.empty or bsk_df.empty:
+            st.error("❌ No data available for recommendations.")
+            return None, None
+        
+        # Filter inactive BSKs if needed
+        if not include_inactive and 'is_active' in bsk_df.columns:
+            bsk_df = bsk_df[bsk_df['is_active'] == True]
+        
+        # Create full description for new service
+        new_service_desc = f"{new_service.get('service_name', '')} {new_service.get('service_type', '')} {new_service.get('service_desc', '')}"
+        new_service_keywords = extract_keywords(new_service_desc)
+        
+        # Calculate similarity with existing services
+        services_df = services_df.copy()
+        
+        # Create full description for each service
+        if 'service_desc' in services_df.columns:
+            services_df['full_desc'] = services_df.apply(
+                lambda row: f"{row.get('service_name', '')} {row.get('service_type', '')} {row.get('service_desc', '')}",
+                axis=1
+            )
+        else:
+            services_df['full_desc'] = services_df.get('service_name', '') + ' ' + services_df.get('service_type', '')
+        
+        # Calculate keyword overlap
+        services_df['keyword_overlap'] = services_df['full_desc'].apply(
+            lambda desc: len(new_service_keywords.intersection(extract_keywords(desc)))
+        )
+        
+        # Calculate text similarity
+        services_df['text_similarity'] = services_df['full_desc'].apply(
+            lambda desc: calculate_text_similarity(new_service_desc, desc)
+        )
+        
+        # Use TF-IDF for better similarity if we have enough data
+        try:
+            if len(services_df) > 1:
+                vectorizer = TfidfVectorizer(max_features=100, stop_words='english', ngram_range=(1, 2))
+                all_descriptions = [new_service_desc] + services_df['full_desc'].tolist()
+                tfidf_matrix = vectorizer.fit_transform(all_descriptions)
+                
+                # Calculate cosine similarity with first vector (new service)
+                from sklearn.metrics.pairwise import cosine_similarity
+                similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+                services_df['tfidf_similarity'] = similarities
+            else:
+                services_df['tfidf_similarity'] = 0.0
+        except Exception as e:
+            st.warning(f"⚠️ TF-IDF calculation failed, using basic similarity: {e}")
+            services_df['tfidf_similarity'] = services_df['text_similarity']
+        
+        # Combine similarities
+        max_kw = max(services_df['keyword_overlap'].max(), 1) if services_df['keyword_overlap'].max() > 0 else 1
+        services_df['total_similarity'] = (
+            0.4 * services_df['tfidf_similarity'] +
+            0.3 * services_df['text_similarity'] +
+            0.3 * (services_df['keyword_overlap'] / max_kw)
+        )
+        
+        # Get similar services (threshold > 0.1)
+        similar_services = services_df[services_df['total_similarity'] > 0.1].copy()
+        similar_services = similar_services.sort_values('total_similarity', ascending=False)
+        similar_service_ids = similar_services['service_id'].tolist()
+        
+        if not similar_service_ids:
+            # If no similar services found, use all services with lower threshold
+            similar_services = services_df.nlargest(min(10, len(services_df)), 'total_similarity')
+            similar_service_ids = similar_services['service_id'].tolist()
+        
+        # Usage analysis - find BSKs that provide similar services
+        if not provisions_df.empty and 'service_id' in provisions_df.columns and 'bsk_id' in provisions_df.columns:
+            relevant_provisions = provisions_df[provisions_df['service_id'].isin(similar_service_ids)]
+            
+            if not relevant_provisions.empty:
+                bsk_counts = relevant_provisions['bsk_id'].value_counts().reset_index()
+                bsk_counts.columns = ['bsk_id', 'usage_count']
+            else:
+                # If no provisions found, give all BSKs equal usage
+                bsk_counts = pd.DataFrame({'bsk_id': bsk_df['bsk_id'].unique(), 'usage_count': 1})
+        else:
+            # If no provisions data, give all BSKs equal usage
+            bsk_counts = pd.DataFrame({'bsk_id': bsk_df['bsk_id'].unique(), 'usage_count': 1})
+        
+        # Merge with BSK data
+        recommended_bsk = bsk_counts.merge(bsk_df, on='bsk_id', how='left')
+        
+        # Calculate score based on usage (min-max normalization)
+        if len(recommended_bsk) > 0:
+            usage_min = recommended_bsk['usage_count'].min()
+            usage_max = recommended_bsk['usage_count'].max()
+            
+            if usage_max > usage_min:
+                recommended_bsk['score'] = (recommended_bsk['usage_count'] - usage_min) / (usage_max - usage_min)
+            else:
+                recommended_bsk['score'] = 1.0
+            
+            # Add reason text
+            def get_reason(row):
+                reasons = []
+                if row['usage_count'] > recommended_bsk['usage_count'].quantile(0.75):
+                    reasons.append("High usage of similar services")
+                elif row['usage_count'] > recommended_bsk['usage_count'].quantile(0.5):
+                    reasons.append("Moderate usage of similar services")
+                else:
+                    reasons.append("Some usage of similar services")
+                
+                if 'district_name' in row and pd.notna(row['district_name']):
+                    reasons.append(f"Located in {row['district_name']}")
+                
+                return "; ".join(reasons)
+            
+            recommended_bsk['reason'] = recommended_bsk.apply(get_reason, axis=1)
+            
+            # Sort by score
+            recommended_bsk = recommended_bsk.sort_values('score', ascending=False)
+            
+            # Limit to top_n
+            recommended_bsk = recommended_bsk.head(top_n)
+            
+            return recommended_bsk, similar_services.head(10)
+        else:
+            st.error("❌ No BSKs found for recommendations.")
+            return None, None
+            
+    except Exception as e:
+        st.error(f"❌ Error generating recommendations: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        return None, None
 
 def get_color_rgba(score):
     """Return RGBA color based on score"""
     if score >= 0.7:
-        return [46, 204, 113, 220]  # Green with transparency
+        return [46, 204, 113, 220]  # Green
     elif score >= 0.4:
-        return [241, 196, 15, 220]  # Yellow with transparency
+        return [241, 196, 15, 220]  # Yellow
     else:
-        return [231, 76, 60, 220]   # Red with transparency
+        return [231, 76, 60, 220]   # Red
 
 # Main Application UI
 st.title("🚀 Recommendation of Relevant BSKs for New Services")
@@ -158,29 +233,7 @@ st.divider()
 
 # System Status Display
 st.subheader("🔧 System Status")
-
-# Initialize embeddings on first load
-if 'embeddings_initialized' not in st.session_state:
-    if AI_FUNCTIONS_AVAILABLE and DATABASE_AVAILABLE:
-        with st.spinner("🔄 Initializing recommendation system with database..."):
-            try:
-                success = initialize_embeddings_from_db(force_rebuild=False)
-                if success:
-                    st.session_state.embeddings_initialized = True
-                    st.success("  recommendation system with embeddings initialized successfully!")
-                else:
-                    st.warning("⚠️ system initialization incomplete. Continuing without precomputed embeddings.")
-                    st.session_state.embeddings_initialized = False
-            except Exception as e:
-                st.error(f"❌ Error initializing embeddings: {e}")
-                st.info("💡 Continuing without precomputed embeddings.")
-                st.session_state.embeddings_initialized = False
-    elif AI_FUNCTIONS_AVAILABLE:
-        st.info("💡 Using API-based recommendation system. Embeddings will be computed on-demand.")
-        st.session_state.embeddings_initialized = False
-    else:
-        st.warning("⚠️ Limited recommendation functionality available.")
-        st.session_state.embeddings_initialized = False
+st.info("💡 Using API-based recommendation system. Recommendations are calculated using text similarity and usage patterns.")
 
 # Service Input Form
 with st.form("new_service_form"):
@@ -192,109 +245,66 @@ with st.form("new_service_form"):
     col1, col2 = st.columns(2)
     
     with col1:
-        if AI_FUNCTIONS_AVAILABLE:
-            # Check if embeddings are available (either initialized or can be initialized)
-            embeddings_available = st.session_state.get('embeddings_initialized', False)
-            if not embeddings_available and DATABASE_AVAILABLE:
-                # Check if we can access ChromaDB for existing embeddings
-                try:
-                    from ai_service.service_recommendation import get_embedding_manager
-                    manager = get_embedding_manager()
-                    embeddings_available = manager.get_service_count() > 0
-                except:
-                    embeddings_available = False
-            
-            use_precomputed = st.checkbox("Use embeddings", 
-                                        value=embeddings_available,
-                                        help="Use precomputed embeddings for faster recommendations")
-        else:
-            use_precomputed = False
-            st.info("embeddings not available")
+        st.info("💡 Recommendations use text similarity and usage analysis")
     
     with col2:
         top_n = st.number_input("Number of recommendations", min_value=1, max_value=1000, value=100)
-        
-        if DATABASE_AVAILABLE:
-            include_inactive = st.checkbox("Include inactive BSKs", value=False)
-        else:
-            include_inactive = False
+        include_inactive = st.checkbox("Include inactive BSKs", value=False)
     
-    submitted = st.form_submit_button("Get Recommendations")
+    submitted = st.form_submit_button("Get Recommendations", type="primary")
 
 # Process form submission
 if submitted:
     if not service_name.strip() or not service_desc.strip():
         st.error("❌ Please provide at least a service name and description.")
-        similar_services = None  # Ensure variable is defined for later display
+        similar_services = None
     else:
         with st.spinner("🤖 Generating recommendations..."):
-            try:
-                new_service = {
-                    "service_name": service_name.strip(),
-                    "service_type": service_type.strip() if service_type.strip() else "General Service",
-                    "service_desc": service_desc.strip()
-                }
-                target_location = None
+            new_service = {
+                "service_name": service_name.strip(),
+                "service_type": service_type.strip() if service_type.strip() else "General Service",
+                "service_desc": service_desc.strip()
+            }
+            
+            recommendations, similar_services = recommend_bsk_for_service_api(
+                new_service=new_service,
+                top_n=top_n,
+                include_inactive=include_inactive
+            )
+            
+            if recommendations is not None and not recommendations.empty:
+                st.session_state.recommendations = recommendations
+                st.session_state.current_page = 1
+                st.session_state.selected_bsk = None
+                st.success(f"🎯 Found {len(recommendations)} BSK recommendations!")
                 
-                recommendations = recommend_bsk_for_service_from_db(
-                    new_service=new_service,
-                    top_n=top_n,
-                    target_location=target_location,
-                    use_precomputed_embeddings=use_precomputed,
-                    include_inactive=include_inactive
-                )
-                # If recommendations is a dict, extract both
-                if isinstance(recommendations, dict) and 'recommendations' in recommendations:
-                    similar_services = recommendations.get('similar_services', None)
-                    recommendations = recommendations['recommendations']
-                else:
-                    similar_services = None
-                
-                if recommendations is not None and not recommendations.empty:
-                    st.session_state.recommendations = recommendations
-                    st.session_state.current_page = 1
-                    st.session_state.selected_bsk = None
-                    st.success(f"🎯 Found {len(recommendations)} BSK recommendations!")
-                    
-                    # Show a quick preview of the top 3
-                    st.write("**🏆 Top 3 Recommendations Preview:**")
-                    top_3 = recommendations.head(3)
-                    for i, (_, row) in enumerate(top_3.iterrows(), 1):
-                        score_emoji = "🟢" if row['score'] >= 0.7 else "🟡" if row['score'] >= 0.4 else "🔴"
-                        st.write(f"{i}. {score_emoji} **{row['bsk_name']}** - Score: {row['score']:.5f}")
-                        if 'reason' in row:
-                            st.write(f"   💡 {row['reason']}")
-                else:
-                    st.error("❌ No recommendations found. Please try adjusting your service description.")
-            except ImportError as e:
-                st.error("❌ Database connection issue. Please ensure the backend is running.")
-                st.code(str(e))
-                similar_services = None
-            except Exception as e:
-                st.error(f"❌ Error generating recommendations: {e}")
-                similar_services = None
+                # Show a quick preview of the top 3
+                st.write("**🏆 Top 3 Recommendations Preview:**")
+                top_3 = recommendations.head(3)
+                for i, (_, row) in enumerate(top_3.iterrows(), 1):
+                    score_emoji = "🟢" if row['score'] >= 0.7 else "🟡" if row['score'] >= 0.4 else "🔴"
+                    st.write(f"{i}. {score_emoji} **{row.get('bsk_name', 'N/A')}** - Score: {row['score']:.3f}")
+                    if 'reason' in row:
+                        st.write(f"   💡 {row['reason']}")
+            else:
+                st.error("❌ No recommendations found. Please try adjusting your service description.")
 
-    # Always display the Top 5 Related Services section after form submission
+    # Display related services
     st.subheader("🔎 Related Services Found")
-    if similar_services is not None and hasattr(similar_services, '__len__') and len(similar_services) > 0:
-        if isinstance(similar_services, pd.DataFrame):
-            top_similar = similar_services.head(5).reset_index(drop=True)
-            st.dataframe(top_similar, use_container_width=True, hide_index=True)
-        elif isinstance(similar_services, list) and isinstance(similar_services[0], dict):
-            top_similar = similar_services[:5]
-            st.dataframe(pd.DataFrame(top_similar), use_container_width=True, hide_index=True)
-        elif isinstance(similar_services, list):
-            top_similar = similar_services[:5]
-            st.write(top_similar)
+    if similar_services is not None and not similar_services.empty:
+        display_cols = ['service_name', 'service_type', 'total_similarity']
+        available_cols = [col for col in display_cols if col in similar_services.columns]
+        if available_cols:
+            st.dataframe(similar_services[available_cols].head(10), use_container_width=True, hide_index=True)
         else:
-            st.write(similar_services)
+            st.dataframe(similar_services.head(10), use_container_width=True, hide_index=True)
     else:
         st.info("No similar services found for your input.")
 
 # Display results if we have recommendations
 if st.session_state.recommendations is not None:
     recommendations = st.session_state.recommendations
-    st.subheader(" BSK Recommendations")
+    st.subheader("📊 BSK Recommendations")
     
     # Display summary statistics
     col1, col2, col3, col4 = st.columns(4)
@@ -302,7 +312,7 @@ if st.session_state.recommendations is not None:
         st.metric("Total BSKs", len(recommendations))
     with col2:
         avg_score = recommendations['score'].mean()
-        st.metric("Average Score", f"{avg_score:.2f}")
+        st.metric("Average Score", f"{avg_score:.3f}")
     with col3:
         high_score_count = len(recommendations[recommendations['score'] >= 0.7])
         st.metric("High Score BSKs", high_score_count)
@@ -319,7 +329,6 @@ if st.session_state.recommendations is not None:
         min_score = st.slider("Minimum Score", 0.0, 1.0, 0.0, 0.05)
     
     with filter_col2:
-        # District filter if available
         if 'district_name' in recommendations.columns:
             districts = ['All'] + sorted(recommendations['district_name'].dropna().unique().tolist())
             selected_district = st.selectbox("District", districts)
@@ -327,7 +336,6 @@ if st.session_state.recommendations is not None:
             selected_district = 'All'
     
     with filter_col3:
-        # Score range filter
         score_range = st.select_slider(
             "Score Range",
             options=['All', 'High (≥0.7)', 'Medium (0.4-0.7)', 'Low (<0.4)'],
@@ -359,7 +367,6 @@ if st.session_state.recommendations is not None:
     total_pages = (len(filtered_recommendations) + items_per_page - 1) // items_per_page
     
     if total_pages > 1:
-        # Create columns for pagination controls
         col1, col2, col3 = st.columns([1, 2, 1])
         with col1:
             if st.button("Previous Page") and st.session_state.current_page > 1:
@@ -370,7 +377,6 @@ if st.session_state.recommendations is not None:
             if st.button("Next Page") and st.session_state.current_page < total_pages:
                 st.session_state.current_page += 1
         
-        # Ensure current page is within bounds
         if st.session_state.current_page > total_pages:
             st.session_state.current_page = total_pages
     
@@ -380,93 +386,62 @@ if st.session_state.recommendations is not None:
     
     if len(filtered_recommendations) > 0:
         display_data = filtered_recommendations.iloc[start_idx:end_idx]
-        
-        # Select which columns to display (exclude some technical columns)
         exclude_cols = ['cluster', 'cluster_size', 'avg_score', 'color']
         display_cols = [col for col in display_data.columns if col not in exclude_cols]
-        
-        st.dataframe(
-            display_data[display_cols],
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(display_data[display_cols], use_container_width=True, hide_index=True)
     else:
         st.warning("No BSKs match the current filters.")
-        
+    
     # Map display
     recommendations_for_map = filtered_recommendations
     
     if 'bsk_lat' in recommendations_for_map.columns and 'bsk_long' in recommendations_for_map.columns:
-        # Add map display options
         st.subheader("🗺️ Geographic Distribution")
         col1, col2 = st.columns(2)
         with col1:
-            use_clustering = st.checkbox("Enable clustering ", value=False, 
+            use_clustering = st.checkbox("Enable clustering", value=False, 
                                        help="Group nearby BSKs to improve map performance")
         with col2:
             dot_size = st.slider("Dot size", min_value=500, max_value=5000, value=2000, step=250)
         
-        # Prepare data for map
         map_df = recommendations_for_map.copy()
         map_df = map_df.rename(columns={'bsk_lat': 'lat', 'bsk_long': 'lon'})
         map_df = map_df.dropna(subset=['lat', 'lon'])
-        
-        # Convert to numeric and filter out invalid coordinates
         map_df['lat'] = pd.to_numeric(map_df['lat'], errors='coerce')
         map_df['lon'] = pd.to_numeric(map_df['lon'], errors='coerce')
         map_df = map_df.dropna(subset=['lat', 'lon'])
-        
-        # Filter out clearly invalid coordinates
         map_df = map_df[
             (map_df['lat'].between(-90, 90)) & 
             (map_df['lon'].between(-180, 180))
         ]
 
-        # Apply clustering if enabled
         if use_clustering and len(map_df) > 50:
-            # Determine number of clusters based on data size
             n_clusters = min(50, len(map_df) // 2)
-            
-            # Prepare coordinates for clustering
             coords = map_df[['lat', 'lon']].values
-            
-            # Perform clustering
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             map_df['cluster'] = kmeans.fit_predict(coords)
             
-            # For each cluster, keep the highest scoring BSK and calculate cluster stats
             cluster_stats = []
             for cluster_id in range(n_clusters):
                 cluster_data = map_df[map_df['cluster'] == cluster_id]
                 if len(cluster_data) > 0:
-                    # Get the best BSK in this cluster
                     best_bsk = cluster_data.loc[cluster_data['score'].idxmax()]
-                    
-                    # Calculate cluster statistics
                     cluster_info = best_bsk.copy()
                     cluster_info['cluster_size'] = len(cluster_data)
                     cluster_info['avg_score'] = cluster_data['score'].mean()
-                    cluster_info['bsk_name'] = f"{best_bsk['bsk_name']} (+{len(cluster_data)-1} others)"
-                    
+                    cluster_info['bsk_name'] = f"{best_bsk.get('bsk_name', 'BSK')} (+{len(cluster_data)-1} others)"
                     cluster_stats.append(cluster_info)
             
             map_df = pd.DataFrame(cluster_stats)
             st.info(f"Clustered {len(recommendations_for_map)} BSKs into {len(map_df)} clusters")
 
         if not map_df.empty:
-            # Apply colors to each row
             map_df['color'] = map_df['score'].apply(get_color_rgba)
-            
-            # Format score for display in tooltip
-            map_df['score_formatted'] = map_df['score'].apply(lambda x: f"{x:.5f}")
-            
-            # Convert to list of lists for PyDeck
+            map_df['score_formatted'] = map_df['score'].apply(lambda x: f"{x:.3f}")
             map_df['color'] = map_df['color'].tolist()
 
-            # Create tooltip content based on clustering mode
             if use_clustering and 'cluster_size' in map_df.columns:
-                # Format avg_score for display as well
-                map_df['avg_score_formatted'] = map_df['avg_score'].apply(lambda x: f"{x:.5f}")
+                map_df['avg_score_formatted'] = map_df['avg_score'].apply(lambda x: f"{x:.3f}")
                 tooltip_html = '''
                 <b>BSK:</b> {bsk_name}<br/>
                 <b>Score:</b> {score_formatted}<br/>
@@ -474,17 +449,13 @@ if st.session_state.recommendations is not None:
                 <b>Avg Score:</b> {avg_score_formatted}
                 '''
             else:
-                # Add more details to tooltip
                 tooltip_html = '<b>BSK:</b> {bsk_name}<br/><b>Score:</b> {score_formatted}'
                 if 'district_name' in map_df.columns:
                     tooltip_html += '<br/><b>District:</b> {district_name}'
                 if 'usage_count' in map_df.columns:
                     map_df['usage_formatted'] = map_df['usage_count'].apply(lambda x: f"{int(x)}")
                     tooltip_html += '<br/><b>Usage Count:</b> {usage_formatted}'
-                if 'reason' in map_df.columns:
-                    tooltip_html += '<br/><b>Reason:</b> {reason}'
             
-            # Create the scatterplot layer
             layer = pdk.Layer(
                 'ScatterplotLayer',
                 data=map_df,
@@ -498,7 +469,6 @@ if st.session_state.recommendations is not None:
                 radius_max_pixels=50,
             )
             
-            # Set up the view state
             view_state = pdk.ViewState(
                 latitude=map_df['lat'].mean(),
                 longitude=map_df['lon'].mean(),
@@ -506,7 +476,6 @@ if st.session_state.recommendations is not None:
                 pitch=0,
             )
             
-            # Create and display the deck
             deck = pdk.Deck(
                 layers=[layer], 
                 initial_view_state=view_state,
@@ -521,7 +490,6 @@ if st.session_state.recommendations is not None:
             
             st.pydeck_chart(deck)
             
-            # Add legend
             legend_text = """
             **Map Legend:**
             - 🟢 Green: High score (≥ 0.7) - Excellent fit for new service
@@ -534,95 +502,41 @@ if st.session_state.recommendations is not None:
             st.markdown(legend_text)
         else:
             st.warning('No BSKs with valid coordinates to display on the map.')
-
-        # BSK Details Section
-        st.subheader("🔍 BSK Details")
-        bsk_options = recommendations_for_map['bsk_name'].tolist() if 'bsk_name' in recommendations_for_map.columns else []
-        if bsk_options:
-            selected_bsk = st.selectbox("Choose a BSK to view detailed information", bsk_options, key='bsk_selector')
-            
-            # Update selected BSK in session state
-            if selected_bsk != st.session_state.selected_bsk:
-                st.session_state.selected_bsk = selected_bsk
-            
-            # Show details for selected BSK
-            if st.session_state.selected_bsk:
-                selected_data = recommendations_for_map[recommendations_for_map['bsk_name'] == st.session_state.selected_bsk]
-                if not selected_data.empty:
-                    st.write("### 📋 Selected BSK Details")
-                    
-                    # Create a nice display of the BSK details
-                    row = selected_data.iloc[0]
-                    
-                    # Basic info in columns
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Score", f"{row['score']:.5f}")
-                        if 'usage_count' in row:
-                            st.metric("Usage Count", int(row['usage_count']))
-                    with col2:
-                        if 'district_name' in row:
-                            st.write(f"**District:** {row['district_name']}")
-                        if 'block_municipalty_name' in row:
-                            st.write(f"**Block/Municipality:** {row['block_municipalty_name']}")
-                    with col3:
-                        if 'reason' in row:
-                            st.write(f"**Recommendation Reason:** {row['reason']}")
-                    
-                    # Display all other relevant columns in an expandable section
-                    with st.expander("View all details"):
-                        # Exclude some columns from detailed view
-                        exclude_detail_cols = ['bsk_lat', 'bsk_long', 'color', 'cluster', 'cluster_size', 'avg_score', 'lat', 'lon']
-                        detail_cols = [col for col in selected_data.columns if col not in exclude_detail_cols]
-                        st.dataframe(selected_data[detail_cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("No BSKs available for detailed view.")
     else:
         st.info("Geographic coordinates not available for map display.")
     
-    # Analytics and Visualizations
-    st.subheader("Recommendation Analytics")
+    # Analytics
+    st.subheader("📈 Recommendation Analytics")
     
     if 'bsk_name' in recommendations_for_map.columns and not recommendations_for_map.empty:
         tab1, tab2, tab3 = st.tabs(["Score Distribution", "Top BSKs", "Geographic Analysis"])
         
         with tab1:
-            # Score distribution histogram using simple binning
             st.write("**Score Distribution:**")
-            
-            # Create bins for the scores
             score_bins = pd.cut(recommendations_for_map['score'], bins=10)
             score_counts = score_bins.value_counts().sort_index()
-            
-            # Create a simple bar chart
-            bin_labels = [f"{interval.left:.1f}-{interval.right:.1f}" for interval in score_counts.index]
+            bin_labels = [f"{interval.left:.2f}-{interval.right:.2f}" for interval in score_counts.index]
             score_df = pd.DataFrame({
                 'Score Range': bin_labels,
                 'Count': score_counts.values
             })
-            
             st.bar_chart(score_df.set_index('Score Range')['Count'])
             
-            # Show summary statistics
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Mean Score", f"{recommendations_for_map['score'].mean():.5f}")
+                st.metric("Mean Score", f"{recommendations_for_map['score'].mean():.3f}")
             with col2:
-                st.metric("Median Score", f"{recommendations_for_map['score'].median():.5f}")
+                st.metric("Median Score", f"{recommendations_for_map['score'].median():.3f}")
             with col3:
-                st.metric("Std Dev", f"{recommendations_for_map['score'].std():.5f}")
+                st.metric("Std Dev", f"{recommendations_for_map['score'].std():.3f}")
         
         with tab2:
-            # Top 20 BSKs bar chart
             top_bsks = recommendations_for_map.head(20)
-            st.bar_chart(
-                top_bsks.set_index('bsk_name')['score'],
-                height=600
-            )
-            st.caption("Top 20 BSKs by recommendation score")
+            if 'bsk_name' in top_bsks.columns:
+                st.bar_chart(top_bsks.set_index('bsk_name')['score'], height=600)
+                st.caption("Top 20 BSKs by recommendation score")
         
         with tab3:
-            # Geographic analysis
             if 'district_name' in recommendations_for_map.columns:
                 district_scores = recommendations_for_map.groupby('district_name').agg({
                     'score': ['mean', 'count'],
@@ -630,7 +544,6 @@ if st.session_state.recommendations is not None:
                 }).round(3)
                 district_scores.columns = ['Avg Score', 'BSK Count', 'Avg Usage']
                 district_scores = district_scores.sort_values('Avg Score', ascending=False)
-                
                 st.write("**Performance by District:**")
                 st.dataframe(district_scores, use_container_width=True)
     
@@ -639,22 +552,20 @@ if st.session_state.recommendations is not None:
     export_col1, export_col2 = st.columns(2)
     
     with export_col1:
-        if st.button("📄 Download as CSV"):
-            csv = recommendations_for_map.to_csv(index=False)
-            st.download_button(
-                label="Click to download CSV",
-                data=csv,
-                file_name="bsk_recommendations.csv",
-                mime="text/csv"
-            )
+        csv = recommendations_for_map.to_csv(index=False)
+        st.download_button(
+            label="📄 Download as CSV",
+            data=csv,
+            file_name="bsk_recommendations.csv",
+            mime="text/csv"
+        )
     
     with export_col2:
-        if st.button("Download Top 50 as CSV"):
-            top_50 = recommendations_for_map.head(50)
-            csv = top_50.to_csv(index=False)
-            st.download_button(
-                label="Click to download Top 50 CSV",
-                data=csv,
-                file_name="top_50_bsk_recommendations.csv",
-                mime="text/csv"
-            )
+        top_50 = recommendations_for_map.head(50)
+        csv = top_50.to_csv(index=False)
+        st.download_button(
+            label="📄 Download Top 50 as CSV",
+            data=csv,
+            file_name="top_50_bsk_recommendations.csv",
+            mime="text/csv"
+        )
